@@ -1,0 +1,44 @@
+{
+  "name": "dsh-paper-reader",
+  "version": "0.2.0",
+  "description": "DSHA 论文阅读器：输入框点「论文」进入三栏界面 —— 左：工作区文稿目录树；中：黑底论文（PDF 走 pdf.js）；右：随时可聊的实时 Agent 对话（总结只是开场白）",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsha",
+    "paper",
+    "reader",
+    "deepseek"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "scripts": {
+    "test": "node test/test-host.mjs && node test/test-chat.mjs && node test/test-client.mjs"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^6.3.289"
+  }
+}

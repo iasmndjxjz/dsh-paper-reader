@@ -1,0 +1,6 @@
+# dsh-paper-reader bundle patch：一行插件装载项。
+# 浏览器半由 package.json 的 dsh.client 声明发现（platform: web）；
+# 宿主半是真实的 apply（注册 /api/paper-reader 路由），因此这一行在宿主 Loader 里是实插件。
+- insert:
+    - id: dsh-paper-reader
+      name: dsh-paper-reader
