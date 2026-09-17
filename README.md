@@ -1,45 +1,33 @@
 # dsh-paper-reader
 
-> DSHA（DeepSeek Harness）插件：**论文阅读器**。右栏不是自绘聊天，而是**论文子代理**的状态台；
-> 真正聊天走平台原生的子会话（输出天然留在你的会话下面）。两种形态自由切换。
+不定时更新。
 
-```
-┌──────────┬───────────────────────┬────────────────────────┐
-│ 目录     │ 论文正文（黑底）        │ 论文子代理（控制台）     │
-│ 工作区树  │ Markdown / PDF(pdf.js) │ 状态 + 只读镜像 + 一键入口 │
-└──────────┴───────────────────────┴────────────────────────┘
-```
+一个给 DSHA（DeepSeek Harness）用的论文阅读插件。点输入框旁边的「论文」，聊天区会换成三栏：左边是工作区里的文稿目录，中间是正文，右边是这篇论文的子代理。
 
-- **三栏形态**：输入框右侧点「论文」。手机窄屏自动变成「目录 / 论文 / 对话」三个页签（同一套实现，桌面并排、手机分页）。
-- **停靠形态**：三栏里点「停靠」（或从右侧栏开「论文」标签），论文挂右侧栏，**中间的原生聊天一动不动**，点「三栏阅读」切回来。
+## 怎么工作
 
-## 论文对话 = 真子代理（不是自搓会话）
+论文对话没有自己实现一套聊天，而是用平台的子代理（`ctx.subagents.startContinuable`）。按下「精读总结」时，会在你当前这个会话下面开一个可续聊的子代理，首轮把论文路径（PDF 还会把抽取出来的正文）交给它。子会话在持久化里的 `parentSession` 就是你当前会话，所以记录留在你原来的对话里，原生那边能看到它的目录也能点开接着聊。
 
-右栏的「精读总结 / 在原生会话里打开」会调用平台的
-[`ctx.subagents.startContinuable()`](https://deepseek-harness.github.io/deepseek-harness/en/reference/subsystems/subagent)，
-在**你当前这个会话**下面开一个可续聊的子代理：
+子代理的工具和系统提示继承父会话的 Agent 预设，插件不做组装；审批策略由平台固定为不询问，面板里不会弹确认。
 
-- 子会话的持久化 header 里 `parentSession` 就是你的会话，所以**记录留在你跟 Agent 的对话里**（原生侧有子代理目录/芯片，可以点开、可以接着聊）；
-- 子代理的**工具与系统提示继承父会话的 Agent 预设**（平台内部 `composeFrom(childCtx, parent.ctx)`），不需要插件做任何组装；
-- 平台把子代理的审批策略钉为 `never`，所以面板里不会弹确认、也不会卡住；
-- 续聊由**人类侧通道**进入：点「在原生会话里打开」→ `ctx.sessions.openSubagent(address)` → 在原生输入框里打字（桌面同时把论文停靠到右侧栏，边看边聊）。
+右侧面板本身是只读的，只显示子代理的状态和镜像。子代理跑完一轮后，平台会回收它的运行实例，这时镜像是通过 `sessionQuery.readSession()` 读持久化日志得到的，不会为了显示把它重新唤醒。要接着聊，点「在原生会话里打开」，切到原生子会话，在原生输入框里打字；桌面端会同时把论文停靠到右侧栏，方便边看边问。
 
-右栏自己**只读**：显示子代理状态（未开始 / 运行中 / 空闲 / 已休眠）与镜像。一行跑完 Activation 会被回收，
-镜像就用 `ctx.sessionQuery.readSession(childId)` 读**冷会话的完整日志**（官方“读冷会话、不激活”的口子），不会为了展示把子代理叫醒。
+## 版面
 
-## 其它
+- 三栏：输入框右侧点「论文」。窗口窄于 900px 时自动变成「目录 / 论文 / 对话」三个页签。
+- 停靠：三栏里点「停靠」，论文挂到右侧栏，中间的原生聊天不受影响；点「三栏阅读」切回来。
 
-- **PDF 用 pdf.js**：中栏真渲染（缩放 / 反色 / 下载），并且**宿主侧抽取文字**——所以 PDF 也能被总结、被追问。
-- **只读**：对用户文件不写不改不删；路径必须落在允许根目录内（`realpath` + 路径边界校验，防 `..` 与前缀逃逸，不跟随软链接）。
-- **不套壳**：阅读器内部没有任何「论文」入口；输入框那个按钮在阅读器打开时变成不可点的「阅读中」，不会出现“论文里再点论文”。
-- **入场动画**：进入阅读器时三栏错开淡入（`prefers-reduced-motion` 下自动关闭）。
+阅读器内部没有第二个「论文」入口，输入框那个按钮在阅读器打开时会变成不可点的「阅读中」，不会叠出一层。进入阅读器时三栏有淡入动画，系统开启减少动态效果时自动关闭。
 
 ## 安装
 
-```bash
-dsha-plugin import /tmp/dsh-paper-reader.zip   # 打包见下
-# 插件行是 patchReload: startup → 在 App 里重启一次 DSHA Web 生效
 ```
+dsha-plugin import /tmp/dsh-paper-reader.zip
+```
+
+插件行是 `patchReload: startup`，装完要在 App 里重启一次 DSHA Web 才会加载。
+
+打包用的脚本：
 
 ```bash
 python3 - <<'PY'
@@ -54,73 +42,74 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
 PY
 ```
 
-卸载：`dsha-plugin delete dsh-paper-reader`（同样需重启）。
+卸载用 `dsha-plugin delete dsh-paper-reader`，同样要重启。
 
 ## 使用
 
-1. 任意会话 → 输入框右侧 **「论文」** → 三栏。
-2. 左栏选文稿（首屏自动打开第一篇 Markdown），中栏阅读。
-3. 右栏点 **「精读总结」**（首轮把论文上下文/PDF 抽取正文喂给子代理），或直接点一条快捷提问。
-4. 想接着聊：点 **「在原生会话里打开」** → 在原生输入框里问（桌面论文停靠旁边）。子代理跑的时候右栏会同步镜像。
-5. `Esc` / 「返回对话」回到原聊天。
+1. 打开任意会话，点输入框右侧的「论文」。
+2. 左栏选一篇文稿（第一次进去会自动打开第一篇 Markdown），中栏阅读。
+3. 右栏点「精读总结」，或者直接点一条快捷提问，例如问它方法和结论。
+4. 想接着聊，点「在原生会话里打开」，在原生输入框里继续问。子代理跑的时候右栏会同步显示。
+5. 按 Esc 或点「返回对话」回到原来的聊天。
+
+## PDF
+
+中栏用 pdf.js 渲染，支持缩放、反色和下载。文字抽取在宿主侧做，所以 PDF 也能总结和追问。扫描版 PDF 没有文字层，抽不出正文，只能当图片看。
 
 ## 配置
 
 | 环境变量 | 说明 |
-|---|---|
-| `DSHA_PAPER_ROOTS` | 追加可读根目录（`:` 分隔）。默认只有 dsh 进程工作目录（本机 = `/root`）。例：`DSHA_PAPER_ROOTS=/sdcard/Download:/sdcard/Documents` |
-| `DSHA_PAPER_PDFJS_DIR` | 覆盖 pdfjs-dist 目录（默认插件内 `node_modules/pdfjs-dist`） |
+| --- | --- |
+| `DSHA_PAPER_ROOTS` | 追加可读根目录，用 `:` 分隔。默认只有 dsh 进程的工作目录，本机是 `/root`。例如要读手机存储：`DSHA_PAPER_ROOTS=/sdcard/Download:/sdcard/Documents` |
+| `DSHA_PAPER_PDFJS_DIR` | pdf.js 所在目录，默认是插件内的 `node_modules/pdfjs-dist` |
 
-## HTTP 接口（宿主半）
+## 接口
 
-全部挂在 `prefix /api/paper-reader`，复用浏览器鉴权（未鉴权 401、非信任域 403）：
+都挂在 `/api/paper-reader` 下面，用和上游 `/api` 一样的浏览器鉴权，没登录返回 401，非信任域返回 403。
 
 | 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/health` | `{ok, roots, version, chat:{available, provider, mode:'subagent'}}` |
+| --- | --- | --- |
+| GET | `/health` | 状态、可读根目录、子代理是否可用 |
 | GET | `/tree?root=&all=1` | 工作区文稿目录树 |
-| GET | `/file?path=` | 单篇：`{kind, text, rawUrl, size, mtime}` |
-| GET | `/raw?path=&download=1` | 原始字节（PDF/图片，正确 MIME + CSP sandbox） |
-| GET | `/text?path=` | pdf.js 抽取的文字（PDF / 文本，带缓存） |
-| GET | `/pdfjs/*` | 转发 pdfjs-dist 静态资源（主模块/worker/cmaps/standard_fonts/wasm） |
-| GET | `/chat?path=&sessionId=` | 子代理状态 + 只读镜像（活会话读事件，冷会话读持久化日志） |
-| POST | `/chat` | 在当前会话下起论文子代理：`{path, sessionId, mode?:'summary'\|'ask', message?}` → `{childId, address, reused}` |
-| GET | `/chat/stream?path=&sessionId=` | 只读镜像流（NDJSON：`state` / `message` / `delta` / `tool` / `idle` / `ping`） |
-| POST | `/chat/interrupt` | 人类权限打断：`subagents.interrupt(childId, {kind:'user', parentSessionId})` |
-| POST | `/chat/reset` | 忘掉这篇论文的子代理映射（下次重起） |
-| POST | `/summary` | 旧的一次性总结接口（走 `ctx.llm`，保留备用） |
+| GET | `/file?path=` | 单篇文件，返回类型、正文和下载地址 |
+| GET | `/raw?path=&download=1` | 原始字节，给 PDF、图片和下载用 |
+| GET | `/text?path=` | pdf.js 抽取出来的文字，带缓存 |
+| GET | `/pdfjs/*` | 转发 pdfjs-dist 的静态资源 |
+| GET | `/chat?path=&sessionId=` | 子代理状态和只读镜像 |
+| POST | `/chat` | 起子代理，参数 `path`、`sessionId`，可选 `mode` 和 `message` |
+| GET | `/chat/stream?path=&sessionId=` | 镜像的流式输出，NDJSON |
+| POST | `/chat/interrupt` | 打断子代理 |
+| POST | `/chat/reset` | 忘掉这篇论文的子代理映射，下次重新起 |
+| POST | `/summary` | 早期的一次性总结接口，走 `ctx.llm`，保留备用 |
 
-## 已知限制
+文件接口只读，不写不改不删。路径会先 `realpath` 再校验是否落在允许的根目录内，防 `..` 和前缀逃逸，不跟随软链接。
 
-- 面板只做只读镜像；**操作面是原生子会话**（那边有完整的流式、工具、队列、审批）。
-- 子代理一轮跑完会被平台回收（`cold`）：镜像仍能读，但要继续聊需点「在原生会话里打开」让它冷恢复。
-- PDF 抽取靠 pdf.js；扫描版（无文字层）PDF 抽不出正文，只能看图。
-- LaTeX 公式按源码显示；DOCX 等不可渲染格式只给下载。
-- 手机存储 `/sdcard` 默认不在可读范围，需 `DSHA_PAPER_ROOTS` 显式开启。
-- 插件行 `patchReload: startup`：安装/更新/卸载后都要重启 DSHA Web。
+## 限制
 
-## 开发与测试
+- 面板只负责显示，实际操作在原生子会话里。
+- 子代理一轮结束后会被回收，镜像还能看，但要继续聊得先点「在原生会话里打开」把它恢复起来。
+- LaTeX 公式按源码显示，DOCX 之类的格式只能下载。
+- 手机存储默认不在可读范围，要用 `DSHA_PAPER_ROOTS` 打开。
+- 安装、更新、卸载后都需要重启 DSHA Web。
 
-```bash
-cd /root/dsh-paper-reader
-pnpm install --ignore-scripts   # devDependencies：react / react-dom / jsdom（pdfjs-dist 是运行时依赖）
+## 开发
+
+```
+pnpm install --ignore-scripts
 pnpm test
 ```
 
-- `test/test-host.mjs`：文件接口、越界/穿越防护、鉴权 401/403、PDF 抽取、pdfjs 资源转发。
-- `test/test-chat.mjs`：假 agents/subagents/sessionQuery + 真 http，覆盖 `startContinuable` 入参（父会话、provider、上下文注入）、
-  复用/换父会话、状态与镜像（含**冷子代理读持久化日志**）、只读流转发与过滤、人类权限打断、重置、错误分支。
-- `test/test-client.mjs`：jsdom + react-dom 真挂载，覆盖三栏、目录树、Markdown、右栏子代理控制台
-  （状态/卡片/快捷提问/镜像渲染/切原生会话/停靠）、停靠模式互切、防套壳、PDF 走 pdf.js 并自动退回 iframe。
+`pdfjs-dist` 是运行时依赖，`react`、`react-dom`、`jsdom` 只在测试时用。
 
-## 文件
+测试分三个文件。`test/test-host.mjs` 覆盖文件接口、越界防护、鉴权和 pdf.js 资源；`test/test-chat.mjs` 用假的 agents、subagents、sessionQuery 服务配真实 http，覆盖子代理的启动参数、复用和换父会话、状态与镜像（包括冷会话读持久化日志）、流式转发、打断和错误分支；`test/test-client.mjs` 用 jsdom 挂载真实组件，覆盖三栏、目录树、Markdown、右栏控制台、两种版面互切和 PDF 回退。
+
+## 目录
 
 | 文件 | 作用 |
-|---|---|
-| `lib/index.js` | 宿主半：路由层（文件/PDF 抽取/子代理/总结）与路径安全 |
-| `lib/chat.js` | 论文子代理引擎：映射落盘、`startContinuable`、活/冷镜像、人类权限打断 |
-| `lib/pdf-text.js` | pdf.js：宿主侧文字抽取 + 浏览器侧资源定位 |
-| `lib/client.js` | 浏览器半：输入框按钮、三栏面板、子代理控制台、停靠标签、动画与样式 |
-| `test/*.mjs` | 三套集成测试 |
+| --- | --- |
+| `lib/index.js` | 路由和路径校验 |
+| `lib/chat.js` | 子代理：映射存储、启动、活/冷镜像、打断 |
+| `lib/pdf-text.js` | pdf.js 的文字抽取和资源定位 |
+| `lib/client.js` | 按钮、三栏面板、子代理控制台、停靠标签、样式 |
 
-MIT。
+MIT
