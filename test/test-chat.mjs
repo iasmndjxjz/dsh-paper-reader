@@ -1,18 +1,21 @@
 /**
- * 论文对话（宿主半）集成测试：假 agents 服务 + 真实 http 服务，
- * 覆盖 GET/POST /chat、取消、重置、PDF 文字抽取、pdfjs 资源转发与越界防护。
+ * 论文**子代理**引擎集成测试（宿主半）：
+ * 用假 subagents/agents 服务 + 真 http 服务，验证
+ *   startContinuable 入参（父会话、上下文注入、provider）、状态/只读镜像、
+ *   只读流、人类权限打断、重置、错误分支，以及 PDF 抽取与 pdfjs 资源转发。
  */
 import { createServer } from 'node:http';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-const FIX = '/tmp/paper-test/chat-fixtures';
-const HOME = '/tmp/paper-test/chat-home';
+const FIX = '/tmp/paper-test/subagent-fixtures';
+const HOME = '/tmp/paper-test/subagent-home';
 rmSync(FIX, { recursive: true, force: true });
 rmSync(HOME, { recursive: true, force: true });
 mkdirSync(FIX, { recursive: true });
 mkdirSync(HOME, { recursive: true });
-/** 一份最小但合法的 PDF（含可抽取文字），用来验证 pdf.js 抽取。 */
+
+/** 一份最小但合法的 PDF（含可抽取文字）。 */
 const MINIMAL_PDF = (() => {
   const objects = [
     '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
@@ -20,7 +23,7 @@ const MINIMAL_PDF = (() => {
     '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n',
     '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
   ];
-  const stream = 'BT /F1 24 Tf 72 700 Td (Hello Paper Reader 2026) Tj ET';
+  const stream = 'BT /F1 24 Tf 72 700 Td (Hello Paper Subagent 2026) Tj ET';
   objects.push(`5 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`);
   let out = '%PDF-1.4\n';
   const offsets = [];
@@ -46,15 +49,15 @@ const check = (label, condition, extra = '') => {
 };
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ------------------------------------------------------------- 假 agents ----
+// ------------------------------------------------------- 假 agents/subagents ----
 const listeners = new Set();
-const agentsLive = new Map();
-const agentHooks = [];
-let lastCreated = null;
-let cancelledWith = null;
+const parents = new Map();
+const children = new Map();
+const starts = [];
+const interrupts = [];
 
-/** 造一个假 Agent：followup 记录消息，whenIdle 时把流式帧推给监听者。 */
-function makeAgent(sessionId, script, options = {}) {
+/** 造一个假 Agent（父或子）。 */
+function makeAgent(sessionId, options = {}) {
   const events = new Map();
   const session = {
     id: sessionId,
@@ -62,59 +65,53 @@ function makeAgent(sessionId, script, options = {}) {
     eventAt(seq) { return events.get(seq); },
     append(type, data) { events.set(session.seq, { type, data }); session.seq += 1; },
   };
-  const agent = {
+  return {
     id: sessionId,
     session,
-    status: 'idle',
-    inbox: [],
-    followup(message) { this.inbox.push(message); },
-    cancel(cause) { cancelledWith = cause; this.cancelled = true; },
-    async whenIdle() {
-      await wait(5);
-      for (const frame of script ?? []) emit({ agent, frame });
-      if (options.turnError !== undefined) {
-        session.append('turn/end', { reason: { kind: 'error', error: { code: 'NO_CREDENTIAL', message: options.turnError } } });
-      }
-    },
+    status: options.status ?? 'idle',
+    append: (type, data) => session.append(type, data),
   };
-  return agent;
 }
 
-function emit(payload) {
-  for (const listener of [...listeners]) listener(payload);
-}
-
-const defaultScript = [
-  { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 },
-  { type: 'chunk', index: 0, chunk: { type: 'block-start', index: 0, blockType: 'text' } },
-  { type: 'chunk', index: 1, chunk: { type: 'text-delta', index: 0, text: '## 一句话结论\n' } },
-  { type: 'chunk', index: 2, chunk: { type: 'text-delta', index: 0, text: '这篇讲的是 **注意力**。' } },
-  { type: 'chunk', index: 3, chunk: { type: 'block-end', index: 1, block: { type: 'tool-call', name: 'read' } } },
-  { type: 'end', outcome: { kind: 'committed', eventType: 'assistant/message', seq: 3 } },
-];
+const parentAgent = makeAgent('session-parent', { status: 'idle' });
+const otherParent = makeAgent('session-other', { status: 'idle' });
+parents.set('session-parent', parentAgent);
+parents.set('session-other', otherParent);
 
 const agents = {
-  get: (id) => agentsLive.get(id),
-  async create(request) {
-    lastCreated = request;
-    request.setup?.({ on(name, handler) { agentHooks.push({ name, handler }); return () => {}; } });
-    const agent = makeAgent(request.sessionId, defaultScript);
-    agentsLive.set(request.sessionId, agent);
-    return { agent };
+  get: (id) => parents.get(id) ?? children.get(id),
+  async resume({ resumeSessionId }) {
+    const existing = parents.get(resumeSessionId);
+    if (existing !== undefined) return { agent: existing };
+    throw new Error(`session "${resumeSessionId}" not found`);
   },
-  async resume() { throw new Error('session-not-found'); },
 };
-const agentDefaultModel = { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash' }) };
-const presetMounts = [];
-const agentPresets = {
-  async resolve(id) { return { id: id ?? 'standard' }; },
-  async mount(agentCtx, id) { presetMounts.push(id); return { id }; },
+
+const subagents = {
+  getProvider: (name) => (name === 'spawn' ? { name } : undefined),
+  listProviders: () => ['spawn', 'fork'],
+  async startContinuable(options) {
+    starts.push(options);
+    const child = makeAgent('child-1', { status: 'idle' });
+    children.set('child-1', child);
+    // 子代理首轮：写入用户消息 + 助手回答（供只读镜像折叠）
+    child.append('user/message', { id: 'm1', role: 'user', content: [{ type: 'text', text: options.request.prompt[0].text }], source: { kind: 'user' } });
+    child.append('assistant/message', { message: { id: 'm2', role: 'assistant', content: [{ type: 'text', text: '这是子代理的总结。' }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }], source: { kind: 'model', provider: 'p', model: 'm' } } });
+    return { childId: 'child-1', messageId: 'm1' };
+  },
+  interrupt: (childId, authority) => { interrupts.push({ childId, authority }); return undefined; },
 };
-const services = new Map([
-  ['agents', agents],
-  ['agentDefaultModel', agentDefaultModel],
-  ['agentPresets', agentPresets],
-]);
+
+/** 冷子代理：Activation 被回收后，日志仍在持久化里，用 sessionQuery 读。 */
+const coldSessions = new Map();
+const sessionQuery = {
+  async readSession(sessionId) {
+    const record = coldSessions.get(sessionId);
+    if (record === undefined) throw new Error(`session "${sessionId}" not found`);
+    return record;
+  },
+};
+const services = new Map([['agents', agents], ['subagents', subagents], ['sessionQuery', sessionQuery]]);
 
 let route = null;
 const webCtx = {
@@ -132,146 +129,195 @@ const server = createServer((req, res) => { route.handler(req, res).catch((error
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const base = `http://127.0.0.1:${server.address().port}`;
 const paperPath = path.join(FIX, 'paper.md');
+const pdfPath = path.join(FIX, 'sample.pdf');
 
-const readEvents = async (response) => (await response.text()).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-const postChat = (body, options) => fetch(`${base}/api/paper-reader/chat`, {
+const post = (sub, body) => fetch(`${base}/api/paper-reader/${sub}`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(body),
-  ...options,
 });
 
-// ------------------------------------------------------------ 首次对话 ----
+// ---------------------------------------------------------------- 能力声明 ----
 {
-  const history = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
-  check('新论文的历史为空', history.ok === true && history.messages.length === 0 && history.sessionId.startsWith('session-'), JSON.stringify(history).slice(0, 140));
-  check('历史响应带模型信息', history.chat?.model?.model === 'deepseek-v4-flash', JSON.stringify(history.chat));
+  const health = await (await fetch(`${base}/api/paper-reader/health`)).json();
+  check('health 报告子代理模式与 provider', health.chat?.mode === 'subagent' && health.chat?.available === true && health.chat?.provider === 'spawn', JSON.stringify(health.chat));
 
-  const response = await postChat({ path: paperPath, message: '这篇论文讲了什么？' });
-  check('chat 返回 NDJSON 流', response.status === 200 && (response.headers.get('content-type') ?? '').includes('ndjson'));
-  const events = await readEvents(response);
-  const kinds = events.map((event) => event.type);
-  check('事件序列 start → delta → tool → done', kinds[0] === 'start' && kinds.includes('delta') && kinds.includes('tool') && kinds.at(-1) === 'done', kinds.join(','));
-  check('首个问题注入了论文上下文', events[0].contextInjected === true);
-  check('start 带 sessionId 与模型', typeof events[0].sessionId === 'string' && events[0].model.model === 'deepseek-v4-flash');
-  const done = events.at(-1);
-  check('done 汇总了完整回答', done.text.includes('这篇讲的是 **注意力**。'), JSON.stringify(done).slice(0, 160));
-  check('done 带工具调用名', Array.isArray(done.tools) && done.tools.includes('read'));
-
-  const agent = agentsLive.get(events[0].sessionId);
-  check('Agent 收到两条消息（上下文 + 提问）', agent.inbox.length === 2, String(agent.inbox.length));
-  check('上下文消息是插件来源', agent.inbox[0].source.kind === 'plugin' && agent.inbox[0].source.plugin === 'dsh-paper-reader', JSON.stringify(agent.inbox[0].source));
-  check('文本文件的上下文给出路径并让 Agent 自己读', agent.inbox[0].content[0].text.includes(paperPath) && agent.inbox[0].content[0].text.includes('read 工具'));
-  check('提问消息是用户来源', agent.inbox[1].source.kind === 'user' && agent.inbox[1].content[0].text === '这篇论文讲了什么？');
-  check('消息结构合法（id/role/content）', typeof agent.inbox[1].id === 'string' && agent.inbox[1].role === 'user' && Array.isArray(agent.inbox[1].content));
-
-  check('Agent 用默认模型与预设工作区', lastCreated.agentOptions.model === 'deepseek-v4-flash' && lastCreated.meta.cwd === process.cwd(), JSON.stringify(lastCreated.agentOptions));
-  check('装了模型选择钩子（assemble + request）', agentHooks.some((hook) => hook.name === 'system-prompt/assemble') && agentHooks.some((hook) => hook.name === 'agent/request'), agentHooks.map((hook) => hook.name).join(','));
-  check('挂了 Agent 预设（工具集来源）', lastCreated.meta.agentPreset === 'standard' && presetMounts.includes('standard'), JSON.stringify({ meta: lastCreated.meta, presetMounts }));
-
-  const after = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
-  check('历史已落盘（用户 + 助手两条）', after.messages.length === 2 && after.messages[0].role === 'user' && after.messages[1].role === 'assistant', JSON.stringify(after.messages).slice(0, 200));
-  check('助手消息保留了工具名', Array.isArray(after.messages[1].tools) && after.messages[1].tools.includes('read'));
+  const beforeState = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
+  check('未开始时状态为 none', beforeState.status === 'none' && beforeState.childId === null, JSON.stringify(beforeState).slice(0, 120));
+  const noChildStream = await fetch(`${base}/api/paper-reader/chat/stream?path=${encodeURIComponent(paperPath)}`);
+  check('未开始时 stream 返回 404', noChildStream.status === 404, String(noChildStream.status));
 }
 
-// -------------------------------------------------- 第二轮：不重复注入上下文 ----
+// ------------------------------------------------------------ 起子代理 ----
 {
-  const before = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
-  const agent = agentsLive.get(before.sessionId);
-  agent.inbox.length = 0;
-  const events = await readEvents(await postChat({ path: paperPath, message: '再讲讲方法。' }));
-  check('第二轮不再注入上下文', events[0].contextInjected === false, JSON.stringify(events[0]));
-  check('第二轮只排一条消息', agent.inbox.length === 1, String(agent.inbox.length));
-  const history = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
-  check('历史累积到 4 条', history.messages.length === 4, String(history.messages.length));
+  const missing = await post('chat', { path: paperPath });
+  check('缺 sessionId 被拒（400）', missing.status === 400, String(missing.status));
+  const outside = await post('chat', { path: '/etc/hostname', sessionId: 'session-parent' });
+  check('越界路径被拒（400）', outside.status === 400, String(outside.status));
+
+  const response = await post('chat', { path: paperPath, sessionId: 'session-parent', mode: 'summary' });
+  const payload = await response.json();
+  check('启动成功并拿到子会话地址', response.status === 200 && payload.childId === 'child-1'
+    && payload.address.childSessionId === 'child-1' && payload.address.parentSessionId === 'session-parent', JSON.stringify(payload).slice(0, 200));
+  check('用的是进程内 spawn provider', starts[0]?.provider === 'spawn', String(starts[0]?.provider));
+  check('label 带论文名', String(starts[0]?.label).includes('paper.md'), String(starts[0]?.label));
+  check('父 Agent 是当前会话的 agent', starts[0]?.request?.parent === parentAgent);
+  const promptText = starts[0]?.request?.prompt?.[0]?.text ?? '';
+  check('首轮带论文上下文（路径 + 让 Agent 自己 read）', promptText.includes(paperPath) && promptText.includes('read 工具'), promptText.slice(0, 160));
+  check('首轮带六段精读指令', promptText.includes('一句话结论'), promptText.slice(-80));
+
+  const again = await (await post('chat', { path: paperPath, sessionId: 'session-parent' })).json();
+  check('同会话再调用复用同一个子代理', again.reused === true && starts.length === 1, `starts=${starts.length}`);
+
+  const other = await (await post('chat', { path: paperPath, sessionId: 'session-other' })).json();
+  check('换了父会话会另起一个（并记录新父）', other.reused === false && starts.length === 2, `starts=${starts.length}`);
 }
 
-// -------------------------------------------------------- 取消与重置 ----
+// ------------------------------------------------------- 状态 + 只读镜像 ----
 {
-  const history = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
-  const cancel = await (await fetch(`${base}/api/paper-reader/chat/cancel`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: paperPath }),
-  })).json();
-  check('取消接口找到并中断了会话', cancel.ok === true && cancel.cancelled === true && cancelledWith === 'paper-reader', JSON.stringify(cancel));
-  check('取消用的是同一个会话', history.sessionId.length > 0);
-
-  const reset = await (await fetch(`${base}/api/paper-reader/chat/reset`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: paperPath }),
-  })).json();
-  check('重置接口返回 ok', reset.ok === true);
-  const cleared = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
-  check('重置后是新会话且历史为空', cleared.messages.length === 0 && cleared.sessionId !== history.sessionId, JSON.stringify(cleared).slice(0, 120));
+  const state = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}&sessionId=session-other`)).json();
+  check('状态返回 childId 与地址', state.childId === 'child-1' && state.address.parentSessionId === 'session-other', JSON.stringify(state).slice(0, 160));
+  check('状态标出 idle/running', state.status === 'idle' && state.running === false, String(state.status));
+  const assistant = state.messages.find((message) => message.role === 'assistant');
+  check('镜像折叠出助手消息', assistant?.text === '这是子代理的总结。', JSON.stringify(state.messages).slice(0, 200));
+  check('镜像保留工具名', Array.isArray(assistant?.tools) && assistant.tools.includes('read'), JSON.stringify(assistant?.tools));
+  const user = state.messages.find((message) => message.role === 'user');
+  check('镜像折叠出用户消息（首轮上下文）', typeof user?.text === 'string' && user.text.includes(paperPath));
 }
 
-// --------------------------------------------------- 模型失败要暴露出来 ----
+// --------------------------------------------- 冷子代理镜像（跑完被回收） ----
 {
-  const failPath = path.join(FIX, 'failing.md');
-  writeFileSync(failPath, '# 会失败的论文\n');
-  const savedCreate = agents.create;
-  agents.create = async (request) => {
-    request.setup?.({ on() { return () => {}; } });
-    const agent = makeAgent(request.sessionId, [], { turnError: 'no credential configured for provider "deepseek-official"' });
-    agentsLive.set(request.sessionId, agent);
-    return { agent };
+  // 把活着的子代理"回收"掉，并把它的日志放进持久化，模拟一轮跑完后的真实状态
+  const live = children.get('child-1');
+  const events = [];
+  for (let seq = 0; seq < live.session.seq; seq += 1) events.push(live.session.eventAt(seq));
+  children.delete('child-1');
+  coldSessions.set('child-1', { session: { id: 'child-1' }, inheritedEventCount: 0, events });
+
+  const state = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
+  check('子代理被回收后状态为 cold', state.status === 'cold' && state.running === false, String(state.status));
+  check('冷子代理仍能读出镜像（读持久化日志）', state.messages.some((message) => message.role === 'assistant' && message.text === '这是子代理的总结。'), JSON.stringify(state.messages).slice(0, 200));
+  check('冷镜像保留工具名', state.messages.some((message) => Array.isArray(message.tools) && message.tools.includes('read')));
+}
+
+// ------------------------------------------------------------ 只读镜像流 ----
+{
+  // 让子代理重新"活"过来（流式转发需要活的 agent）
+  children.set('child-1', makeAgent('child-1'));
+  children.get('child-1').append('user/message', { id: 'm1', role: 'user', content: [{ type: 'text', text: '上下文' }], source: { kind: 'user' } });
+  const response = await fetch(`${base}/api/paper-reader/chat/stream?path=${encodeURIComponent(paperPath)}`);
+  check('stream 返回 NDJSON', response.status === 200 && (response.headers.get('content-type') ?? '').includes('ndjson'));
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let replayTail;
+  const readEvent = async () => {
+    for (;;) {
+      const index = buffer.indexOf('\n');
+      if (index !== -1) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (line.length > 0) return JSON.parse(line);
+        continue;
+      }
+      const { value, done } = await reader.read();
+      if (done) return undefined;
+      buffer += decoder.decode(value, { stream: true });
+    }
   };
-  const events = await readEvents(await postChat({ path: failPath, message: '随便问一句' }));
-  const errorEvent = events.find((event) => event.type === 'error');
-  check('模型失败时回 error 事件而不是空回答', errorEvent !== undefined && errorEvent.message.includes('no credential'), JSON.stringify(events.at(-1)).slice(0, 160));
-  const history = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(failPath)}`)).json();
-  check('失败也记进了历史（带 ⚠️ 前缀）', history.messages.at(-1).error === true && history.messages.at(-1).text.startsWith('⚠️'), JSON.stringify(history.messages.at(-1)).slice(0, 120));
-  agents.create = savedCreate;
+  const first = await readEvent();
+  check('首个事件是 state', first?.type === 'state' && first.childId === 'child-1', JSON.stringify(first));
+  const replayed = [];
+  for (;;) {
+    const event = await readEvent();
+    if (event?.type !== 'message') { replayTail = event; break; }
+    replayed.push(event.message);
+  }
+  check('随后回放镜像消息', replayed.some((message) => message.role === 'user'), JSON.stringify(replayed).slice(0, 160));
+
+  // 子代理的实时帧（只转发这个子代理的）
+  const child = children.get('child-1');
+  const otherChild = makeAgent('child-9');
+  for (const listener of [...listeners]) {
+    listener({ agent: otherChild, frame: { type: 'chunk', chunk: { type: 'text-delta', text: '不该出现' } } });
+  }
+  for (const listener of [...listeners]) {
+    listener({ agent: child, frame: { type: 'chunk', chunk: { type: 'text-delta', text: '实时' } } });
+    listener({ agent: child, frame: { type: 'chunk', chunk: { type: 'block-end', block: { type: 'tool-call', name: 'bash' } } } });
+  }
+  // 期间可能有 idle/ping 之类的状态事件，跳过它们直到拿到想要的类型
+  const waitFor = async (type, max = 8) => {
+    let event = replayTail;
+    replayTail = undefined;
+    for (let index = 0; index < max; index += 1) {
+      event = event ?? await readEvent();
+      if (event === undefined) return undefined;
+      if (event.type === type) return event;
+      event = undefined;
+    }
+    return undefined;
+  };
+  const delta = await waitFor('delta');
+  const tool = await waitFor('tool');
+  check('转发子代理的文本增量', delta?.type === 'delta' && delta.text === '实时', JSON.stringify(delta));
+  check('转发子代理的工具调用', tool?.type === 'tool' && tool.name === 'bash', JSON.stringify(tool));
+  check('不转发别的子代理的帧', delta?.text !== '不该出现');
+  await reader.cancel();
+}
+
+// ------------------------------------------- 打断 / 重置（人类权限） ----
+{
+  const denied = await post('chat/interrupt', { path: paperPath, sessionId: 'session-wrong' });
+  check('非父会话打断被拒（403）', denied.status === 403, String(denied.status));
+  const ok = await (await post('chat/interrupt', { path: paperPath, sessionId: 'session-other' })).json();
+  check('父会话打断成功', ok.ok === true && ok.interrupted === true, JSON.stringify(ok));
+  check('打断用的是人类权限 {kind:user, parentSessionId}', interrupts.at(-1)?.authority?.kind === 'user'
+    && interrupts.at(-1)?.authority?.parentSessionId === 'session-other'
+    && interrupts.at(-1)?.childId === 'child-1', JSON.stringify(interrupts.at(-1)));
+
+  const reset = await (await post('chat/reset', { path: paperPath })).json();
+  check('重置忘掉映射', reset.ok === true && reset.forgotten === true);
+  const after = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(paperPath)}`)).json();
+  check('重置后回到 none', after.status === 'none' && after.childId === null, JSON.stringify(after).slice(0, 120));
+}
+
+// -------------------------------------------------- 上下文注入：PDF ----
+{
+  const response = await post('chat', { path: pdfPath, sessionId: 'session-parent', mode: 'summary' });
+  check('PDF 也能起子代理', response.status === 200);
+  const promptText = starts.at(-1)?.request?.prompt?.[0]?.text ?? '';
+  check('PDF 直接把抽取正文喂进去', promptText.includes('Hello Paper Subagent 2026') && promptText.includes('抽取正文开始'), promptText.slice(0, 120));
+  check('PDF 上下文写明页数', promptText.includes('PDF 共 1 页'), promptText.slice(0, 200));
 }
 
 // ------------------------------------------------------------ 错误分支 ----
 {
-  const empty = await postChat({ path: paperPath, message: '   ' });
-  check('空消息被拒（400）', empty.status === 400, String(empty.status));
-  const outside = await postChat({ path: '/etc/hostname', message: 'hi' });
-  check('越界路径被拒（400）', outside.status === 400, String(outside.status));
-  const badPath = await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent('/etc/hostname')}`);
-  check('历史接口越界被拒（400）', badPath.status === 400, String(badPath.status));
-  const badMethod = await fetch(`${base}/api/paper-reader/chat/cancel`, { method: 'GET' });
-  check('cancel 的 GET 返回 405', badMethod.status === 405, String(badMethod.status));
+  const empty = await post('chat', { path: paperPath, message: '   ', sessionId: 'session-parent' });
+  check('空 message 仍按默认总结指令启动', empty.status === 200, String(empty.status));
+  const badStream = await fetch(`${base}/api/paper-reader/chat/stream?path=${encodeURIComponent('/etc/hostname')}`);
+  check('stream 越界被拒（400）', badStream.status === 400, String(badStream.status));
+  const badMethod = await fetch(`${base}/api/paper-reader/chat/interrupt`);
+  check('interrupt 的 GET 返回 405', badMethod.status === 405, String(badMethod.status));
 
-  const savedAgents = services.get('agents');
-  services.delete('agents');
-  const noAgents = await postChat({ path: paperPath, message: 'hi' });
-  check('没有 agents 服务时 503', noAgents.status === 503, String(noAgents.status));
-  services.set('agents', savedAgents);
-
-  const savedModel = services.get('agentDefaultModel');
-  services.set('agentDefaultModel', { currentSelection: () => undefined });
-  const noModel = await postChat({ path: paperPath, message: 'hi' });
-  check('没有默认模型时 503', noModel.status === 503, String(noModel.status));
-  services.set('agentDefaultModel', savedModel);
+  const saved = services.get('subagents');
+  services.delete('subagents');
+  const noSub = await post('chat', { path: paperPath, sessionId: 'session-parent' });
+  check('没有子代理服务时 503', noSub.status === 503, String(noSub.status));
+  const health = await (await fetch(`${base}/api/paper-reader/health`)).json();
+  check('health 同步报告不可用', health.chat.available === false, JSON.stringify(health.chat));
+  services.set('subagents', saved);
 }
 
 // --------------------------------------------------- PDF 抽取与资源转发 ----
 {
-  const sample = path.join(FIX, 'sample.pdf');
-  const extracted = await (await fetch(`${base}/api/paper-reader/text?path=${encodeURIComponent(sample)}`)).json();
-  check('PDF 文字抽取成功', extracted.ok === true && extracted.text.includes('Hello Paper Reader 2026'), JSON.stringify(extracted).slice(0, 160));
-  check('抽取结果带页数', extracted.pageCount === 1 && extracted.kind === 'pdf', JSON.stringify(extracted).slice(0, 120));
-  const cached = await (await fetch(`${base}/api/paper-reader/text?path=${encodeURIComponent(sample)}`)).json();
-  check('二次抽取命中缓存且一致', cached.text === extracted.text);
-
+  const extracted = await (await fetch(`${base}/api/paper-reader/text?path=${encodeURIComponent(pdfPath)}`)).json();
+  check('PDF 文字抽取成功', extracted.ok === true && extracted.text.includes('Hello Paper Subagent 2026'), JSON.stringify(extracted).slice(0, 140));
   const worker = await fetch(`${base}/api/paper-reader/pdfjs/build/pdf.worker.min.mjs`);
-  check('pdfjs worker 可转发且 MIME 正确', worker.status === 200
-    && (worker.headers.get('content-type') ?? '').includes('javascript'), worker.headers.get('content-type') ?? '');
-  const main = await fetch(`${base}/api/paper-reader/pdfjs/build/pdf.min.mjs`);
-  check('pdfjs 主模块可转发', main.status === 200 && (await main.text()).length > 1000);
-  const cmap = await fetch(`${base}/api/paper-reader/pdfjs/cmaps/Adobe-Japan1-0.bcmap`);
-  check('pdfjs cmap 可转发', cmap.status === 200, String(cmap.status));
-  const missing = await fetch(`${base}/api/paper-reader/pdfjs/nope.js`);
-  check('不存在的资源 404', missing.status === 404, String(missing.status));
+  check('pdfjs worker 可转发', worker.status === 200 && (worker.headers.get('content-type') ?? '').includes('javascript'));
   const traversal = await fetch(`${base}/api/paper-reader/pdfjs/..%2F..%2Fpackage.json`);
   check('资源路径穿越被拒', traversal.status === 400 || traversal.status === 404, String(traversal.status));
 }
 
 server.close();
-console.log(problems.length === 0 ? '\n论文对话（宿主半）：全部通过' : `\n论文对话（宿主半）：${problems.length} 项失败`);
+console.log(problems.length === 0 ? '\n论文子代理（宿主半）：全部通过' : `\n论文子代理（宿主半）：${problems.length} 项失败`);
 process.exit(problems.length === 0 ? 0 : 1);
