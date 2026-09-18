@@ -120,9 +120,16 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (url.pathname === '/api/paper-reader/chat' && method === 'POST') {
     const body = JSON.parse(String(init.body ?? '{}'));
-    startedChild = 'child-1';
     lastStart = body;
-    return Response.json({ ok: true, childId: 'child-1', address: { parentSessionId: 's1', childSessionId: 'child-1', mode: 'continuable' }, reused: false, chat: CHAT_STATE.chat });
+    const first = startedChild === null;
+    startedChild = 'child-1';
+    return Response.json({
+      ok: true,
+      childId: 'child-1',
+      address: { parentSessionId: 's1', childSessionId: 'child-1', mode: 'continuable' },
+      ...(first ? { started: true, reused: false } : { delivered: true, messageId: 'm1' }),
+      chat: CHAT_STATE.chat,
+    });
   }
   if (url.pathname === '/api/paper-reader/chat/stream') {
     const stream = new ReadableStream({
@@ -276,42 +283,43 @@ check('中栏渲染表格', container.querySelector('.dpr-paper-inner table') !=
 check('中栏渲染引用', container.querySelector('.dpr-paper-inner blockquote') !== null);
 check('中栏渲染行内代码', container.querySelectorAll('.dpr-paper-inner code').length >= 2);
 
-// ------------------------------------------------ 右栏：子代理控制台 ----
-check('右栏标题是「论文子代理」', container.innerHTML.includes('论文子代理'));
+// ------------------------------------------------ 右栏：聊天样式 ----
+check('右栏标题是「论文」', container.querySelector('.dpr-chat-head-title')?.textContent.includes('论文') === true);
 check('拉了子代理状态', calls.some((call) => call.startsWith('GET /api/paper-reader/chat?path=')));
-check('显示状态标签（未开始）', container.innerHTML.includes('未开始'));
-check('有「精读总结」卡片', findByText(container, '精读总结') !== undefined);
-check('有「在原生会话里打开」卡片', findByText(container, '在原生会话里打开') !== undefined);
-check('空态给出快捷提问', container.querySelectorAll('.dpr-quick button').length >= 3);
-check('右栏没有自绘发送框（打字进原生会话）', container.querySelector('.dpr-console textarea') === null);
+check('有输入框且可用（直接聊）', container.querySelector('.dpr-composer textarea')?.disabled === false);
+check('空态给出快捷提问', container.querySelectorAll('.dpr-quick button').length === 3);
+check('空态有「直接问就行」的说明', container.innerHTML.includes('直接问就行'));
 
-// 点「精读总结」→ 宿主起子代理
-click(findByText(container, '精读总结'));
-await flush(80);
-check('POST /chat 启动了论文子代理', calls.some((call) => call.startsWith('POST /api/paper-reader/chat')));
-check('启动带了 mode=summary 与父会话 id', lastStart?.mode === 'summary' && lastStart?.sessionId === 's1', JSON.stringify(lastStart).slice(0, 160));
-check('启动带上了论文路径', lastStart?.path === '/root/papers/attention.md', String(lastStart?.path));
-check('状态不再显示「未开始」', !container.innerHTML.includes('未开始'), container.querySelector('.dpr-console-msgs')?.innerHTML.slice(0,120));
+// 第一次发送：连带把论文交给子代理
+const composer = container.querySelector('.dpr-composer textarea');
+type(composer, '这篇解决了什么问题？');
+await flush(20);
+click(findByText(container, '发送'));
+await flush(120);
+check('POST /chat 带了消息', calls.some((call) => call.startsWith('POST /api/paper-reader/chat')) && lastStart?.message === '这篇解决了什么问题？', JSON.stringify(lastStart).slice(0, 140));
+check('POST 带了父会话 id 与论文路径', lastStart?.sessionId === 's1' && lastStart?.path === '/root/papers/attention.md', JSON.stringify(lastStart).slice(0, 140));
+check('本地先显示了用户气泡', container.querySelector('.dpr-msg[data-role="user"] .dpr-bubble')?.textContent.includes('这篇解决了什么问题') === true);
+check('输入框已清空', container.querySelector('.dpr-composer textarea')?.value === '');
+
+// 第二次发送：走已存在的子代理（delivered）
+type(container.querySelector('.dpr-composer textarea'), '再讲讲方法。');
+await flush(20);
+click(findByText(container, '发送'));
+await flush(120);
+check('第二次发送仍是同一路径请求', lastStart?.message === '再讲讲方法。', JSON.stringify(lastStart).slice(0, 120));
+check('两条用户气泡', container.querySelectorAll('.dpr-msg[data-role="user"]').length === 2, String(container.querySelectorAll('.dpr-msg[data-role="user"]').length));
 
 // 只读镜像流
 await flush(400);
-console.log('DEBUG mirror:', container.querySelector('.dpr-console-msgs')?.innerHTML?.replace(/\s+/g,' ').slice(0, 260));
 check('订阅了只读镜像流', calls.some((call) => call.startsWith('GET /api/paper-reader/chat/stream')));
-check('镜像渲染了子代理输出', container.querySelector('.dpr-console-msgs .dpr-bubble')?.textContent.includes('注意力') === true,
-  container.querySelector('.dpr-console-msgs')?.innerHTML.slice(0, 200));
+check('镜像渲染了子代理输出', container.querySelector('.dpr-msgs .dpr-bubble h2')?.textContent === '一句话结论', container.querySelector('.dpr-msgs')?.innerHTML.slice(0, 200));
 
-// 「在原生会话里打开」→ openSubagent + 论文停靠
+// 「原生打开」→ openSubagent + 论文停靠
 const beforeOpen = openedSubagents.length;
-click(findByText(container, '在原生会话里打开'));
+click(findByText(container, '原生打开'));
 await flush(30);
 check('切到了原生子会话', openedSubagents.length === beforeOpen + 1 && openedSubagents.at(-1).childSessionId === 'child-1', JSON.stringify(openedSubagents));
 check('桌面同时把论文停靠到右侧栏', dockOpen.at(-1) === 'paper', JSON.stringify(dockOpen));
-
-// 快捷提问：有子代理时写进原生输入框草稿
-const quickButton = container.querySelector('.dpr-quick button');
-click(quickButton);
-await flush(250);
-check('快捷提问写进了原生草稿', typeof draftWritten === 'string' && draftWritten.length > 0, String(draftWritten));
 
 // ---------------------------------------------------------- 停靠模式 ----
 {

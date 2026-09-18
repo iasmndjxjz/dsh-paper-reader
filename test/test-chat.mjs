@@ -5,7 +5,7 @@
  *   只读流、人类权限打断、重置、错误分支，以及 PDF 抽取与 pdfjs 资源转发。
  */
 import { createServer } from 'node:http';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const FIX = '/tmp/paper-test/subagent-fixtures';
@@ -55,6 +55,7 @@ const parents = new Map();
 const children = new Map();
 const starts = [];
 const interrupts = [];
+const prompts = [];
 
 /** 造一个假 Agent（父或子）。 */
 function makeAgent(sessionId, options = {}) {
@@ -99,6 +100,7 @@ const subagents = {
     child.append('assistant/message', { message: { id: 'm2', role: 'assistant', content: [{ type: 'text', text: '这是子代理的总结。' }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }], source: { kind: 'model', provider: 'p', model: 'm' } } });
     return { childId: 'child-1', messageId: 'm1' };
   },
+  async prompt(request) { prompts.push(request); return { messageId: 'm-prompt-1' }; },
   interrupt: (childId, authority) => { interrupts.push({ childId, authority }); return undefined; },
 };
 
@@ -155,7 +157,7 @@ const post = (sub, body) => fetch(`${base}/api/paper-reader/${sub}`, {
   const outside = await post('chat', { path: '/etc/hostname', sessionId: 'session-parent' });
   check('越界路径被拒（400）', outside.status === 400, String(outside.status));
 
-  const response = await post('chat', { path: paperPath, sessionId: 'session-parent', mode: 'summary' });
+  const response = await post('chat', { path: paperPath, sessionId: 'session-parent' });
   const payload = await response.json();
   check('启动成功并拿到子会话地址', response.status === 200 && payload.childId === 'child-1'
     && payload.address.childSessionId === 'child-1' && payload.address.parentSessionId === 'session-parent', JSON.stringify(payload).slice(0, 200));
@@ -163,11 +165,23 @@ const post = (sub, body) => fetch(`${base}/api/paper-reader/${sub}`, {
   check('label 带论文名', String(starts[0]?.label).includes('paper.md'), String(starts[0]?.label));
   check('父 Agent 是当前会话的 agent', starts[0]?.request?.parent === parentAgent);
   const promptText = starts[0]?.request?.prompt?.[0]?.text ?? '';
-  check('首轮带论文上下文（路径 + 让 Agent 自己 read）', promptText.includes(paperPath) && promptText.includes('read 工具'), promptText.slice(0, 160));
-  check('首轮带六段精读指令', promptText.includes('一句话结论'), promptText.slice(-80));
+  check('提示词是中文', /[\u4e00-\u9fa5]/.test(promptText.slice(0, 40)), promptText.slice(0, 60));
+  check('提示词直接给文件路径并让它自己读', promptText.includes(paperPath) && promptText.includes('read'), promptText.slice(0, 160));
+  check('提示词带六段精读指令', promptText.includes('一句话结论'), promptText.slice(-80));
+
+  // 已有子代理 + 带 message → 走人类通道直接发（不再另起）
+  const sent = await (await post('chat', { path: paperPath, sessionId: 'session-parent', message: '它的注意力是怎么算的？' })).json();
+  check('已有子代理时直接发消息', sent.ok === true && sent.delivered === true && sent.childId === 'child-1', JSON.stringify(sent).slice(0, 160));
+  check('发消息没有再另起子代理', starts.length === 1, `starts=${starts.length}`);
+  check('用的是人类通道 subagents.prompt', prompts.at(-1)?.parentSessionId === 'session-parent'
+    && prompts.at(-1)?.childSessionId === 'child-1'
+    && prompts.at(-1)?.content?.[0]?.text === '它的注意力是怎么算的？'
+    && prompts.at(-1)?.mode === 'continuable'
+    && prompts.at(-1)?.delivery === 'queue'
+    && typeof prompts.at(-1)?.requestId === 'string' && prompts.at(-1).requestId.length > 0, JSON.stringify(prompts.at(-1)));
 
   const again = await (await post('chat', { path: paperPath, sessionId: 'session-parent' })).json();
-  check('同会话再调用复用同一个子代理', again.reused === true && starts.length === 1, `starts=${starts.length}`);
+  check('不带 message 再调用复用同一个子代理', again.reused === true && starts.length === 1, `starts=${starts.length}`);
 
   const other = await (await post('chat', { path: paperPath, sessionId: 'session-other' })).json();
   check('换了父会话会另起一个（并记录新父）', other.reused === false && starts.length === 2, `starts=${starts.length}`);
@@ -283,17 +297,21 @@ const post = (sub, body) => fetch(`${base}/api/paper-reader/${sub}`, {
 
 // -------------------------------------------------- 上下文注入：PDF ----
 {
-  const response = await post('chat', { path: pdfPath, sessionId: 'session-parent', mode: 'summary' });
-  check('PDF 也能起子代理', response.status === 200);
+  const response = await post('chat', { path: pdfPath, sessionId: 'session-parent' });
+  check('PDF 也能起子代理', response.status === 200, String(response.status));
   const promptText = starts.at(-1)?.request?.prompt?.[0]?.text ?? '';
-  check('PDF 直接把抽取正文喂进去', promptText.includes('Hello Paper Subagent 2026') && promptText.includes('抽取正文开始'), promptText.slice(0, 120));
-  check('PDF 上下文写明页数', promptText.includes('PDF 共 1 页'), promptText.slice(0, 200));
+  check('PDF 直接把文件交给它、让它用工具读', promptText.includes(pdfPath) && promptText.includes('工具'), promptText.slice(0, 200));
+  check('PDF 提示词给出缓存兜底路径', /cache\/[^\s]+\.md/.test(promptText), promptText.slice(0, 300));
+  check('PDF 写明页数', promptText.includes('1 页'), promptText.slice(0, 240));
+  const cacheMatch = promptText.match(/\/cache\/[^\s]+\.md/);
+  const cacheFile = cacheMatch === null ? undefined : path.join(HOME, 'storages', 'paper-reader', cacheMatch[0]);
+  check('抽取正文确实写进了缓存文件', cacheFile !== undefined && existsSync(cacheFile) && readFileSync(cacheFile, 'utf8').includes('Hello Paper Subagent 2026'), String(cacheFile));
 }
 
 // ------------------------------------------------------------ 错误分支 ----
 {
   const empty = await post('chat', { path: paperPath, message: '   ', sessionId: 'session-parent' });
-  check('空 message 仍按默认总结指令启动', empty.status === 200, String(empty.status));
+  check('message 只有空白时退化成复用（不误发空消息）', empty.status === 200, String(empty.status));
   const badStream = await fetch(`${base}/api/paper-reader/chat/stream?path=${encodeURIComponent('/etc/hostname')}`);
   check('stream 越界被拒（400）', badStream.status === 400, String(badStream.status));
   const badMethod = await fetch(`${base}/api/paper-reader/chat/interrupt`);
