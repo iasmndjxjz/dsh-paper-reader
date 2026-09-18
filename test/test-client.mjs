@@ -89,6 +89,8 @@ const CHAT_STREAM = [
   JSON.stringify({ type: 'state', childId: 'child-1', running: true, live: true }),
   JSON.stringify({ type: 'delta', text: '## 一句话结论\n' }),
   JSON.stringify({ type: 'delta', text: '这篇用 **注意力** 取代循环。\n' }),
+  JSON.stringify({ type: 'tool', name: 'read' }),
+  JSON.stringify({ type: 'delta', text: '\n读完了。\n' }),
   JSON.stringify({ type: 'idle', at: Date.now() }),
 ].join('\n');
 const CHAT_NDJSON = [
@@ -103,6 +105,7 @@ const CHAT_NDJSON = [
 const calls = [];
 let startedChild = null;
 let lastStart = null;
+const serverMirror = [];
 globalThis.fetch = async (input, init = {}) => {
   const method = init.method ?? 'GET';
   const url = new URL(String(input), 'http://127.0.0.1:3080');
@@ -111,7 +114,7 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.pathname === '/api/paper-reader/tree') return Response.json(TREE);
   if (url.pathname === '/api/paper-reader/file') return Response.json(fileFor(target));
   if (url.pathname === '/api/paper-reader/chat' && method === 'GET') {
-    return Response.json({ ...CHAT_STATE, path: target, ...(startedChild === null ? {} : {
+    return Response.json({ ...CHAT_STATE, path: target, messages: [...serverMirror], ...(startedChild === null ? {} : {
       childId: startedChild,
       address: { parentSessionId: 's1', childSessionId: startedChild, mode: 'continuable' },
       status: 'running',
@@ -121,6 +124,9 @@ globalThis.fetch = async (input, init = {}) => {
   if (url.pathname === '/api/paper-reader/chat' && method === 'POST') {
     const body = JSON.parse(String(init.body ?? '{}'));
     lastStart = body;
+    if (typeof body.message === 'string' && body.message.trim().length > 0) {
+      serverMirror.push({ role: 'user', text: body.message.trim(), at: Date.now() });
+    }
     const first = startedChild === null;
     startedChild = 'child-1';
     return Response.json({
@@ -313,6 +319,8 @@ check('两条用户气泡', container.querySelectorAll('.dpr-msg[data-role="user
 await flush(400);
 check('订阅了只读镜像流', calls.some((call) => call.startsWith('GET /api/paper-reader/chat/stream')));
 check('镜像渲染了子代理输出', container.querySelector('.dpr-msgs .dpr-bubble h2')?.textContent === '一句话结论', container.querySelector('.dpr-msgs')?.innerHTML.slice(0, 200));
+check('工具调用显示成标签', container.querySelectorAll('.dpr-msgs .dpr-tool').length >= 1, container.querySelector('.dpr-msgs')?.innerHTML.slice(0, 260));
+check('聊天面板是黑底白字样式', container.innerHTML.includes('dpr-chat') === true);
 
 // 「原生打开」→ openSubagent + 论文停靠
 const beforeOpen = openedSubagents.length;

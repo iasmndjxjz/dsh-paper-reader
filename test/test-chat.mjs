@@ -168,6 +168,7 @@ const post = (sub, body) => fetch(`${base}/api/paper-reader/${sub}`, {
   check('提示词是中文', /[\u4e00-\u9fa5]/.test(promptText.slice(0, 40)), promptText.slice(0, 60));
   check('提示词直接给文件路径并让它自己读', promptText.includes(paperPath) && promptText.includes('read'), promptText.slice(0, 160));
   check('提示词带六段精读指令', promptText.includes('一句话结论'), promptText.slice(-80));
+  check('不带 message 时退化成“先通读一遍”的兜底句', promptText.includes('请先通读全文') && !promptText.includes('【我的问题】'), promptText.slice(-70));
 
   // 已有子代理 + 带 message → 走人类通道直接发（不再另起）
   const sent = await (await post('chat', { path: paperPath, sessionId: 'session-parent', message: '它的注意力是怎么算的？' })).json();
@@ -196,7 +197,21 @@ const post = (sub, body) => fetch(`${base}/api/paper-reader/${sub}`, {
   check('镜像折叠出助手消息', assistant?.text === '这是子代理的总结。', JSON.stringify(state.messages).slice(0, 200));
   check('镜像保留工具名', Array.isArray(assistant?.tools) && assistant.tools.includes('read'), JSON.stringify(assistant?.tools));
   const user = state.messages.find((message) => message.role === 'user');
-  check('镜像折叠出用户消息（首轮上下文）', typeof user?.text === 'string' && user.text.includes(paperPath));
+  check('首轮交接提示词不出现在镜像里', user === undefined, JSON.stringify(user ?? null).slice(0, 120));
+}
+
+// ---------------------------------------- 带提问的首轮：只显示用户那句话 ----
+{
+  const askPath = path.join(FIX, 'ask.md');
+  writeFileSync(askPath, '# Ask\n\n正文。\n');
+  const response = await post('chat', { path: askPath, sessionId: 'session-parent', message: '它的方法是什么？' });
+  const payload = await response.json();
+  check('带提问也能起子代理', response.status === 200 && typeof payload.childId === 'string', JSON.stringify(payload).slice(0, 120));
+  const promptText = starts.at(-1)?.request?.prompt?.[0]?.text ?? '';
+  check('提示词里有分隔标记和用户那句话', promptText.includes('【我的问题】') && promptText.endsWith('它的方法是什么？'), promptText.slice(-60));
+  const state = await (await fetch(`${base}/api/paper-reader/chat?path=${encodeURIComponent(askPath)}`)).json();
+  const users = state.messages.filter((message) => message.role === 'user');
+  check('镜像里只留下用户那句话', users.length === 1 && users[0].text === '它的方法是什么？', JSON.stringify(users).slice(0, 140));
 }
 
 // --------------------------------------------- 冷子代理镜像（跑完被回收） ----
